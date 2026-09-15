@@ -1,0 +1,20 @@
+<?php
+
+namespace App\Http\Resources;
+
+use App\Models\Tag;
+use Heritage\Http\Request;
+use Heritage\Http\Resources\Json\JsonResource;
+
+/**
+ * @mixin Tag
+ */
+class PlainLabelResource extends JsonResource
+{
+    public function toArray(Request $request): array
+    {
+        return [
+            'label' => $this->label,
+        ];
+    }
+}

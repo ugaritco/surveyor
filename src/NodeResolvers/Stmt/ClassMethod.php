@@ -1,0 +1,120 @@
+<?php
+
+namespace Ugarit\Surveyor\NodeResolvers\Stmt;
+
+use Heritage\Foundation\Http\FormRequest;
+use Heritage\Validation\ValidationRuleParser;
+use Ugarit\Surveyor\Analysis\EntityType;
+use Ugarit\Surveyor\Analysis\Scope;
+use Ugarit\Surveyor\Analyzed\ClassLikeResult;
+use Ugarit\Surveyor\Analyzed\MethodResult;
+use Ugarit\Surveyor\Analyzed\PropertyResult;
+use Ugarit\Surveyor\NodeResolvers\AbstractResolver;
+use Ugarit\Surveyor\NodeResolvers\Shared\ResolvesIgnoreMarkers;
+use Ugarit\Surveyor\Types\ArrayType;
+use Ugarit\Surveyor\Types\Contracts\Type as TypeContract;
+use Ugarit\Surveyor\Types\StringType;
+use Ugarit\Surveyor\Types\Type;
+use PhpParser\Node;
+
+class ClassMethod extends AbstractResolver
+{
+    use ResolvesIgnoreMarkers;
+
+    public function resolve(Node\Stmt\ClassMethod $node)
+    {
+        $this->scope->setMethodName($node->name);
+        $this->scope->setEntityType(EntityType::METHOD_TYPE);
+
+        $result = new MethodResult(
+            name: $this->scope->methodName(),
+        );
+
+        if ($marker = $this->ignoreMarker($node)) {
+            $result->flagAsIgnored($marker);
+        }
+
+        $this->scope->attachResult($result);
+
+        if ($node->returnType && $returnTypes = $this->from($node->returnType)) {
+            $this->scope->addReturnType($returnTypes, $node->getStartLine());
+        }
+
+        if ($node->name == '__construct') {
+            foreach ($node->params as $param) {
+                if (! $param->isPromoted()) {
+                    continue;
+                }
+
+                $this->scope->parent()->result()->addProperty(
+                    new PropertyResult(
+                        name: $param->var->name,
+                        type: $this->from($param->type),
+                        visibility: match (true) {
+                            $param->isProtected() => 'protected',
+                            $param->isPrivate() => 'private',
+                            default => 'public',
+                        },
+                        ignore: $this->ignoreMarker($param),
+                    ),
+                );
+            }
+        }
+
+        return null;
+    }
+
+    public function scope(): Scope
+    {
+        return $this->scope->newChildScope();
+    }
+
+    public function exitScope(): Scope
+    {
+        foreach ($this->scope->parameters() as $parameter) {
+            $this->scope->result()->addParameter($parameter->name, $parameter->type);
+        }
+
+        $isFormRequestRules = in_array(FormRequest::class, $this->scope->parent()->extends()) && $this->scope->methodName() === 'rules';
+
+        foreach ($this->scope->returnTypes() as $returnType) {
+            $this->scope->result()->addReturnType($returnType['type'], $returnType['lineNumber']);
+
+            if ($isFormRequestRules && Type::is($returnType['type'], ArrayType::class)) {
+                foreach ($returnType['type']->value as $key => $value) {
+                    if ($value instanceof StringType) {
+                        $this->scope->result()->addValidationRule(
+                            $key,
+                            array_map(
+                                fn ($subRule) => ValidationRuleParser::parse($subRule),
+                                explode('|', $value->value),
+                            ),
+                        );
+                    } elseif ($value instanceof ArrayType) {
+                        $this->scope->result()->addValidationRule(
+                            $key,
+                            array_values(array_filter(array_map($this->parseSubRule(...), $value->value))),
+                        );
+                    }
+                }
+            }
+        }
+
+        if (($parentResult = $this->scope->parent()?->result()) instanceof ClassLikeResult
+            && ($scopeResult = $this->scope->result()) instanceof MethodResult) {
+            $parentResult->addMethod($scopeResult);
+        }
+
+        return $this->scope->parent();
+    }
+
+    protected function parseSubRule(TypeContract $subRule)
+    {
+        if ($subRule instanceof StringType) {
+            return ValidationRuleParser::parse($subRule->value);
+        }
+
+        // Class based rules are not supported yet
+        return null;
+    }
+}

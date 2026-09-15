@@ -1,0 +1,188 @@
+<?php
+
+namespace App\Models;
+
+// use Heritage\Contracts\Auth\MustVerifyEmail;
+use App\DTOs\MoneyDTO;
+use App\DTOs\PriceDTO;
+use Heritage\Database\Eloquent\Casts\Attribute;
+use Heritage\Database\Eloquent\Factories\HasFactory;
+use Heritage\Database\Eloquent\Relations\HasMany;
+use Heritage\Foundation\Auth\User as Authenticatable;
+use Heritage\Notifications\Notifiable;
+use Workbench\Database\Factories\UserFactory;
+
+class User extends Authenticatable
+{
+    /** @use HasFactory<UserFactory> */
+    use HasFactory, Notifiable;
+
+    /**
+     * The attributes that are mass assignable.
+     *
+     * @var list<string>
+     */
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+    ];
+
+    /**
+     * The attributes that should be hidden for serialization.
+     *
+     * @var list<string>
+     */
+    protected $hidden = [
+        'password',
+        'remember_token',
+    ];
+
+    /**
+     * Get the attributes that should be cast.
+     *
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+        ];
+    }
+
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+
+    /**
+     * @return Attribute<string, never>
+     */
+    protected function formattedName(): Attribute
+    {
+        return Attribute::make(
+            get: fn (): string => 'User: '.$this->name,
+        );
+    }
+
+    /**
+     * @return Attribute<int|null, never>
+     */
+    protected function ageInMonths(): Attribute
+    {
+        return Attribute::make(
+            get: fn (): ?int => null,
+        );
+    }
+
+    protected function withoutDocBlock(): Attribute
+    {
+        return Attribute::make(
+            get: fn (): string => 'no doc',
+        );
+    }
+
+    protected function moneyInCents(): Attribute
+    {
+        return Attribute::make(
+            get: fn (): int => (int) ($this->attributes['amount'] * 100),
+        );
+    }
+
+    protected function money(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => new MoneyDTO(
+                amount: (int) ($this->attributes['amount'] ?? 0),
+                currency: $this->attributes['currency'] ?? 'USD',
+            ),
+        );
+    }
+
+    protected function withoutDocBlockClosure(): Attribute
+    {
+        return Attribute::make(
+            get: function (): string {
+                return 'no doc closure';
+            },
+        );
+    }
+
+    protected function moneyClosure(): Attribute
+    {
+        return Attribute::make(
+            get: function (): MoneyDTO {
+                return new MoneyDTO(
+                    amount: (int) ($this->attributes['amount'] ?? 0),
+                    currency: $this->attributes['currency'] ?? 'USD',
+                );
+            },
+        );
+    }
+
+    protected function moneyClosureUntyped(): Attribute
+    {
+        return Attribute::make(
+            get: function () {
+                return new MoneyDTO(
+                    amount: (int) ($this->attributes['amount'] ?? 0),
+                    currency: $this->attributes['currency'] ?? 'USD',
+                );
+            },
+        );
+    }
+
+    protected function price(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => new PriceDTO(
+                amount: (int) ($this->attributes['amount'] ?? 0),
+                currency: $this->attributes['currency'] ?? 'USD',
+            ),
+        );
+    }
+
+    protected function attributeViaStaticGet(): Attribute
+    {
+        return Attribute::get(
+            fn (mixed $value): string => $value ?? 'fallback',
+        );
+    }
+
+    protected function attributeViaConstructor(): Attribute
+    {
+        return new Attribute(
+            get: function (): string {
+                return 'constructed';
+            },
+        );
+    }
+
+    protected function moneyViaStaticGet(): Attribute
+    {
+        return Attribute::get(
+            fn (): MoneyDTO => new MoneyDTO(
+                amount: (int) ($this->attributes['amount'] ?? 0),
+                currency: $this->attributes['currency'] ?? 'USD',
+            ),
+        );
+    }
+
+    protected function moneyViaConstructor(): Attribute
+    {
+        return new Attribute(
+            get: fn (): MoneyDTO => new MoneyDTO(
+                amount: (int) ($this->attributes['amount'] ?? 0),
+                currency: $this->attributes['currency'] ?? 'USD',
+            ),
+        );
+    }
+
+    protected function attributeWithSetterOnly(): Attribute
+    {
+        return Attribute::set(
+            fn (string $value): string => strtolower($value),
+        );
+    }
+}

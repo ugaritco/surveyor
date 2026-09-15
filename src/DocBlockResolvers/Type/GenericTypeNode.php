@@ -1,0 +1,118 @@
+<?php
+
+namespace Ugarit\Surveyor\DocBlockResolvers\Type;
+
+use Ugarit\Surveyor\DocBlockResolvers\AbstractResolver;
+use Ugarit\Surveyor\Types\ArrayShapeType;
+use Ugarit\Surveyor\Types\ClassType;
+use Ugarit\Surveyor\Types\Contracts\MultiType;
+use Ugarit\Surveyor\Types\Contracts\Type as TypeContract;
+use Ugarit\Surveyor\Types\StringType;
+use Ugarit\Surveyor\Types\Type;
+use PHPStan\PhpDocParser\Ast;
+
+class GenericTypeNode extends AbstractResolver
+{
+    public function resolve(Ast\Type\GenericTypeNode $node)
+    {
+        $genericTypes = array_map(
+            fn ($type) => $this->resolveGeneric($this->from($type)),
+            $node->genericTypes,
+        );
+
+        switch ($node->type->name) {
+            case 'array':
+            case 'non-empty-array':
+            case 'non-empty-list':
+                $baseType = array_shift($genericTypes);
+
+                if ($baseType === null) {
+                    $baseType = Type::mixed();
+                }
+
+                return Type::arrayShape($baseType, Type::union(...$genericTypes));
+            case 'list':
+                return Type::arrayShape(Type::int(), Type::union(...$genericTypes));
+            case 'class-string':
+                return Type::union(...array_map(fn ($t) => $t === null ? null : $this->resolveClassStringType($t), $genericTypes));
+            case 'array-key':
+                return Type::union(...$genericTypes);
+            case 'object':
+                return Type::union(...$genericTypes);
+            case 'iterable':
+                return $this->handleIterableType($node, $genericTypes);
+            case 'int':
+            case 'positive-int':
+            case 'negative-int':
+            case 'non-negative-int':
+            case 'non-positive-int':
+                return Type::int();
+            default:
+                return $this->handleUnknownType($node);
+        }
+    }
+
+    protected function resolveGeneric(?TypeContract $type)
+    {
+        if ($type === null) {
+            return Type::mixed();
+        }
+
+        if (! $type instanceof StringType) {
+            return $type;
+        }
+
+        foreach ($this->scope->getTemplateTags() as $templateTag) {
+            if ($templateTag->name === $type->value) {
+                return $templateTag->bound;
+            }
+        }
+
+        return $type;
+    }
+
+    protected function resolveClassStringType(TypeContract $type)
+    {
+        if ($type instanceof MultiType) {
+            return Type::intersection(...array_map(fn ($t) => $this->resolveClassStringType($t), $type->getTypes()));
+        }
+
+        if (! property_exists($type, 'value')) {
+            return Type::mixed();
+        }
+
+        return new ClassType($this->scope->getUse($type->value));
+    }
+
+    protected function handleIterableType(Ast\Type\GenericTypeNode $node, array $genericTypes)
+    {
+        $tags = [];
+
+        foreach ($node->genericTypes as $index => $tag) {
+            if (property_exists($tag, 'name') && $templateTag = $this->scope->getTemplateTag($tag->name)) {
+                $tags[] = $templateTag;
+            } else {
+                $tags[] = $genericTypes[$index];
+            }
+        }
+
+        return Type::arrayShape($tags[0] ?? Type::mixed(), $tags[1] ?? Type::mixed());
+    }
+
+    protected function handleUnknownType(Ast\Type\GenericTypeNode $node)
+    {
+        if ($node->type instanceof Ast\Type\IdentifierTypeNode) {
+            $type = $this->from($node->type);
+
+            if ($type instanceof ClassType) {
+                return $type->setGenericTypes(array_map(fn ($t) => $this->from($t), $node->genericTypes));
+            }
+
+            if ($type instanceof ArrayShapeType) {
+                return $type;
+            }
+
+            return null;
+        }
+    }
+}

@@ -1,0 +1,240 @@
+<?php
+
+namespace Ugarit\Surveyor\NodeResolvers\Expr;
+
+use Heritage\Http\Resources\Json\JsonResource;
+use Heritage\Support\Facades\Validator;
+use Ugarit\Surveyor\Analysis\Condition;
+use Ugarit\Surveyor\Analyzer\ResourceAnalyzer;
+use Ugarit\Surveyor\NodeResolvers\AbstractResolver;
+use Ugarit\Surveyor\NodeResolvers\Shared\AddsValidationRules;
+use Ugarit\Surveyor\NodeResolvers\Shared\ResolvesClosureReturnTypes;
+use Ugarit\Surveyor\NodeResolvers\Shared\ResolvesEloquentAttributes;
+use Ugarit\Surveyor\Support\Util;
+use Ugarit\Surveyor\Types\ClassType;
+use Ugarit\Surveyor\Types\Contracts\MultiType;
+use Ugarit\Surveyor\Types\Entities\InertiaRender;
+use Ugarit\Surveyor\Types\Entities\View;
+use Ugarit\Surveyor\Types\StringType;
+use Ugarit\Surveyor\Types\Type;
+use Ugarit\Surveyor\Types\UnionType;
+use PhpParser\Node;
+use Throwable;
+
+class StaticCall extends AbstractResolver
+{
+    use AddsValidationRules, ResolvesClosureReturnTypes, ResolvesEloquentAttributes;
+
+    public function resolve(Node\Expr\StaticCall $node)
+    {
+        $class = $this->from($node->class);
+        $method = $node->name instanceof Node\Identifier ? $node->name->name : $this->from($node->name);
+
+        if ($method === 'macro') {
+            if (Type::is($class, ClassType::class)) {
+                $this->handleMacro($class, $node);
+            }
+        }
+
+        if ($class instanceof ClassType && $class->value === Validator::class && $method === 'make') {
+            $this->addValidationRules($node->args[1]->value);
+        }
+
+        if ($class instanceof UnionType) {
+            $class = $this->resolveUnion($class);
+        }
+
+        if ($class instanceof StringType) {
+            return ($class->value === null) ? null : Type::mixed();
+        }
+
+        if ($method instanceof MultiType) {
+            $returnTypes = [];
+
+            foreach ($method->getTypes() as $type) {
+                $methodName = Type::stringValue($type);
+
+                if ($methodName === null) {
+                    continue;
+                }
+
+                $returnTypes = array_merge(
+                    $returnTypes,
+                    $this->reflector->methodReturnType($class, $methodName, $node),
+                );
+            }
+
+            return Type::union(...$returnTypes);
+        }
+
+        if ($class instanceof Condition) {
+            $class = $class->type;
+        }
+
+        if (is_string($method) && $this->isAttributeFactory($class, $method)) {
+            return $this->attributeTypeFrom($node->args);
+        }
+
+        $entityReturnTypes = $this->handleEntities($class, $method, $node);
+
+        if ($class instanceof ClassType && $this->entitiesFullyDescribeReturnType($class, $method, $entityReturnTypes)) {
+            return Type::union(...$entityReturnTypes);
+        }
+
+        $returnTypes = array_merge(
+            $entityReturnTypes,
+            $this->reflector->methodReturnType($class, $method, $node),
+        );
+
+        return Type::union(...$returnTypes);
+    }
+
+    protected function handleMacro(ClassType $class, Node\Expr\StaticCall $node): void
+    {
+        $macroName = $this->from($node->args[0]->value);
+        $macroResolution = $this->from($node->args[1]->value);
+
+        if (Type::is($macroName, StringType::class) && $macroName->value !== null) {
+            $this->scope->addMacro($class->value, $macroName->value, $macroResolution);
+        }
+    }
+
+    protected function handleEntities(ClassType $class, string $method, Node\Expr\StaticCall $node): array
+    {
+        return match ($class->value) {
+            'Inertia\Inertia' => $this->handleInertiaEntity($method, $node),
+            'Heritage\Support\Facades\View' => $this->handleViewEntity($method, $node),
+            default => $this->handleEntitiesFallback($class, $method, $node),
+        };
+    }
+
+    protected function handleEntitiesFallback(ClassType $class, string $method, Node\Expr\StaticCall $node): array
+    {
+        if (in_array($method, ['collection', 'make'])) {
+            return $this->handlePossibleResourceStaticCall($class, isCollection: $method === 'collection');
+        }
+
+        return [];
+    }
+
+    protected function entitiesFullyDescribeReturnType(ClassType $class, string $method, array $entityReturnTypes): bool
+    {
+        if (count($entityReturnTypes) === 0) {
+            return false;
+        }
+
+        if (
+            $class->value === 'Inertia\Inertia'
+            && in_array($method, ['defer', 'optional', 'lazy', 'always', 'merge'], true)
+        ) {
+            return true;
+        }
+
+        // Resource ::collection() / ::make() entity types fully describe the return shape;
+        // unioning the documented AnonymousResourceCollection only adds noise.
+        if (! in_array($method, ['collection', 'make'], true)) {
+            return false;
+        }
+
+        $resolved = $class->resolved();
+
+        return class_exists($resolved) && is_subclass_of($resolved, JsonResource::class);
+    }
+
+    protected function handlePossibleResourceStaticCall(ClassType $class, bool $isCollection): array
+    {
+        $resolved = $class->resolved();
+
+        if (! class_exists($resolved) || ! is_subclass_of($resolved, JsonResource::class)) {
+            return [];
+        }
+
+        try {
+            $resourceResponse = app(ResourceAnalyzer::class)->buildResourceResponse($resolved, isCollection: $isCollection);
+
+            if ($resourceResponse) {
+                return [$resourceResponse];
+            }
+        } catch (Throwable $e) {
+            // Unable to resolve resource
+        }
+
+        return [];
+    }
+
+    protected function handleInertiaEntity(string $method, Node\Expr\StaticCall $node): array
+    {
+        if ($method === 'render') {
+            $args = array_map(fn ($arg) => $this->from($arg->value), $node->getArgs());
+
+            return [
+                new InertiaRender(
+                    $args[0]->value,
+                    $args[1] ?? Type::arrayShape(Type::string(), Type::mixed()),
+                ),
+            ];
+        }
+
+        if (in_array($method, ['defer', 'optional', 'lazy', 'always', 'merge'], true)) {
+            $args = $node->getArgs();
+
+            if (empty($args)) {
+                return [Type::mixed()];
+            }
+
+            $type = $this->resolveClosureReturnType($args[0]->value) ?? Type::mixed();
+
+            if (in_array($method, ['defer', 'optional', 'lazy'], true)) {
+                $type->optional();
+            }
+
+            return [$type];
+        }
+
+        return [];
+    }
+
+    protected function handleViewEntity(string $method, Node\Expr\StaticCall $node): array
+    {
+        if ($method !== 'render') {
+            return [];
+        }
+
+        $args = array_map(fn ($arg) => $this->from($arg->value), $node->getArgs());
+
+        return [
+            new View(
+                $args[0]->value,
+                $args[1] ?? Type::arrayShape(Type::string(), Type::mixed()),
+            ),
+        ];
+    }
+
+    public function resolveForCondition(Node\Expr\StaticCall $node)
+    {
+        return $this->resolve($node);
+    }
+
+    protected function resolveUnion(UnionType $union)
+    {
+        foreach ($union->types as $type) {
+            if ($type instanceof ClassType) {
+                return $type;
+            }
+
+            if ($type instanceof StringType) {
+                if (Util::isClassOrInterface($type->value)) {
+                    return new ClassType($type->value);
+                }
+
+                $templateTag = $this->scope->getTemplateTag($type->value);
+
+                if ($templateTag) {
+                    return $templateTag->bound;
+                }
+            }
+        }
+
+        return null;
+    }
+}
